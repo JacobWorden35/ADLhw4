@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision as tv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image
@@ -101,8 +102,17 @@ class CLIP(nn.Module):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+        self.temperature = temperature
+        
+        # Get the hidden dimensions from the encoders
+        # Vision encoder output dimension
+        vision_hidden_dim = vision_encoder.config.hidden_size
+        # Text encoder output dimension
+        text_hidden_dim = text_encoder.config.hidden_size
+        
+        # Projection layers to project both encoders to the same dimension
+        self.vision_projection = nn.Linear(vision_hidden_dim, proj_dim)
+        self.text_projection = nn.Linear(text_hidden_dim, proj_dim)
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(image)
@@ -178,9 +188,42 @@ class CLIP(nn.Module):
             (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
             (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
         Returns:
-            TODO: think about the what values should be returned
+            vision_features: Projected vision features (normalized)
+            text_features: Projected text features (normalized)
+            temperature: The temperature value
         """
-        raise NotImplementedError("Not implemented")
+        # Encode images
+        vision_outputs = self.vision_encoder(pixel_values)
+        # Get the pooled output (CLS token or mean pooling)
+        if hasattr(vision_outputs, 'pooler_output') and vision_outputs.pooler_output is not None:
+            vision_embeds = vision_outputs.pooler_output
+        elif hasattr(vision_outputs, 'last_hidden_state'):
+            # Use mean pooling if no pooler output
+            vision_embeds = vision_outputs.last_hidden_state.mean(dim=1)
+        else:
+            vision_embeds = vision_outputs[0].mean(dim=1)
+        
+        # Encode text
+        text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        # Get the pooled output
+        if hasattr(text_outputs, 'pooler_output') and text_outputs.pooler_output is not None:
+            text_embeds = text_outputs.pooler_output
+        elif hasattr(text_outputs, 'last_hidden_state'):
+            # Use the last token's embedding (or mean pooling)
+            # For causal LM, typically use the last token
+            text_embeds = text_outputs.last_hidden_state[:, -1, :]
+        else:
+            text_embeds = text_outputs[0][:, -1, :]
+        
+        # Project to common dimension
+        vision_features = self.vision_projection(vision_embeds)
+        text_features = self.text_projection(text_embeds)
+        
+        # Normalize features (important for contrastive learning)
+        vision_features = F.normalize(vision_features, p=2, dim=-1)
+        text_features = F.normalize(text_features, p=2, dim=-1)
+        
+        return vision_features, text_features, self.temperature
 
 
 def compute_clip_loss(
@@ -199,7 +242,26 @@ def compute_clip_loss(
     Returns:
         The loss for the CLIP model.
     """
-    raise NotImplementedError("Not implemented")
+    vision_features, text_features, temperature = outputs
+    
+    # Compute similarity matrix (logits)
+    # Shape: [batch_size, batch_size]
+    logits = torch.matmul(vision_features, text_features.T) / temperature
+    
+    # Create labels: each image should match with its corresponding text
+    batch_size = vision_features.shape[0]
+    targets = torch.arange(batch_size, device=vision_features.device)
+    
+    # Compute cross-entropy loss in both directions
+    # Image-to-text loss
+    loss_i2t = F.cross_entropy(logits, targets)
+    # Text-to-image loss
+    loss_t2i = F.cross_entropy(logits.T, targets)
+    
+    # Average the two losses
+    loss = (loss_i2t + loss_t2i) / 2
+    
+    return loss
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
@@ -218,12 +280,12 @@ def get_target_modules_for_lora(model: nn.Module) -> list[str]:
 
 def train(
     data_dir: Path | None = None,
-    output_dir: str = "clip",
-    num_train_epochs: float = 0.05,  # for debugging purpose, increase this once the dry run works
+    output_dir: str = "clip_model",
+    num_train_epochs: float = 1,  # for debugging purpose, increase this once the dry run works
     per_device_train_batch_size: int = 1024,
     gradient_accumulation_steps: int = 1,
     learning_rate: float = 5e-4,
-    num_workers: int = 16,
+    num_workers: int = 2,
 ):
     vlm = BaseVLM()
 
